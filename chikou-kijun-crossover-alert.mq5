@@ -61,19 +61,19 @@ void OnTick()
     if (!IsNewBar())
         return;
 
-    double chikou[2], kijun[2];
+    double chikou26[2], kijun26[2];
 
-    if (CopyBuffer(ichimokuHandle, 4, 26, 2, chikou) < 2 ||
-        CopyBuffer(ichimokuHandle, 1, 26, 2, kijun) < 2)
+    if (CopyBuffer(ichimokuHandle, 4, 26, 2, chikou26) < 2 ||
+        CopyBuffer(ichimokuHandle, 1, 26, 2, kijun26) < 2)
     {
         Alert("Buffer copy error for ", _Symbol);
         return;
     }
 
-    double chikouPrev = chikou[1];
-    double chikouCurr = chikou[0];
-    double kijunPrev = kijun[1];
-    double kijunCurr = kijun[0];
+    double chikouPrev = chikou26[1];
+    double chikouCurr = chikou26[0];
+    double kijunPrev = kijun26[1];
+    double kijunCurr = kijun26[0];
 
     bool bullishCross = (chikouPrev < kijunPrev) && (chikouCurr > kijunCurr);
     bool bearishCross = (chikouPrev > kijunPrev) && (chikouCurr < kijunCurr);
@@ -86,7 +86,7 @@ void OnTick()
     }
     else if (bearishCross && EnableAlerts)
     {
-        Alert(_Symbol, " Bearish Crossover on ", EnumToString(Timeframe), " at ", DoubleToString(price, _Digits));
+        Alert(_Symbol, " Bearish Crossover on ", TimeframeToString(Timeframe), " at ", DoubleToString(price, _Digits));
     }
 }
 
