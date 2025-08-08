@@ -1,22 +1,25 @@
 //+------------------------------------------------------------------+
-//|                  Simple Ichimoku Alert EA: Chikou crossing Kijun |
-//|                                                       Neo Malesa |
-//|                                     https://www.x.com/n30dyn4m1c |
+//|  Simple Ichimoku Alert EA: Chikou crossing historical Kijun (MT5)
+//|  Fires only after candle close (no intrabar alerts)
+//|  Author: Neo Malesa  |  https://www.x.com/n30dyn4m1c
 //+------------------------------------------------------------------+
 #property copyright "Neo Malesa"
 #property link      "https://www.x.com/n30dyn4m1c"
-#property version   "1.03"
+#property version   "1.04"
 #property strict
 
-input ENUM_TIMEFRAMES Timeframe = PERIOD_CURRENT;
-input ulong  MagicNumber   = 20250717;
-input bool   EnableAlerts  = true;
+//==================== Inputs ====================//
+input ENUM_TIMEFRAMES Timeframe = PERIOD_CURRENT; // evaluation timeframe
+input ulong  MagicNumber   = 20250717;            // not used for trading; kept for consistency
+input bool   EnableAlerts  = true;                // platform alerts
+input bool   DebugLog      = false;               // print diagnostics
 
-// --- internal settings
+// Ichimoku parameters
 input int Tenkan = 9;
-input int Kijun  = 26;
+input int Kijun  = 26; // also the Chikou offset
 input int Senkou = 52;
 
+//================ Utility =======================//
 string TimeframeToString(ENUM_TIMEFRAMES tf)
 {
     switch(tf)
@@ -46,15 +49,17 @@ string TimeframeToString(ENUM_TIMEFRAMES tf)
     }
 }
 
-int      ichimokuHandle = INVALID_HANDLE;
-datetime lastAlertBarTime = 0; // avoids duplicate alerts per bar
+//================ Globals =======================//
+int      g_ichimokuHandle = INVALID_HANDLE;
+datetime g_lastAlertBarTime = 0; // prevents duplicate alerts per bar
 
+//================ Lifecycle =====================//
 int OnInit()
 {
-    ichimokuHandle = iIchimoku(_Symbol, Timeframe, Tenkan, Kijun, Senkou);
-    if (ichimokuHandle == INVALID_HANDLE)
+    g_ichimokuHandle = iIchimoku(_Symbol, Timeframe, Tenkan, Kijun, Senkou);
+    if (g_ichimokuHandle == INVALID_HANDLE)
     {
-        Alert("Failed to create Ichimoku handle for ", _Symbol);
+        Alert("[Ichimoku EA] Failed to create handle for ", _Symbol, ", TF=", TimeframeToString(Timeframe));
         return INIT_FAILED;
     }
     return INIT_SUCCEEDED;
@@ -62,10 +67,11 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
-    if (ichimokuHandle != INVALID_HANDLE)
-        IndicatorRelease(ichimokuHandle);
+    if (g_ichimokuHandle != INVALID_HANDLE)
+        IndicatorRelease(g_ichimokuHandle);
 }
 
+// New bar detector (on selected Timeframe)
 bool IsNewBar()
 {
     static datetime lastTime = 0;
@@ -78,58 +84,78 @@ bool IsNewBar()
     return false;
 }
 
+// Ensure we can reference 26-27 bars back with closed-bar confirmation
 bool EnoughBars()
 {
-    // Need enough history to reference Chikou and Kijun values from 26+ bars back
     int bars = Bars(_Symbol, Timeframe);
-    return (bars >= (Kijun + 3));
+    return (bars >= (Kijun + 2));
 }
 
+//================ Core ==========================//
 void OnTick()
 {
+    // Evaluate only once per new bar → previous bar is closed
     if (!IsNewBar())
         return;
 
     if (!EnoughBars())
         return;
 
-    // CLOSED-BAR CONFIRMATION:
-    //   Bullish: Chikou crosses ABOVE historical Kijun (both values from same historical bar)
-    //   Bearish: Chikou crosses BELOW historical Kijun
-    double chikouPlottedAtClosedBar[2]; // Chikou plotted points for closed bar and its previous
-    double kijunHistoricalAtClosedBar[2]; // Kijun values from the same historical bars as Chikou
+    // Alignments (closed-bar confirmation):
+    // - Chikou buffer index 4 at shifts [0,1] → plotted points for the just-closed bar and its previous.
+    //   These correspond to price bars [26,27] back.
+    // - Kijun buffer index 1 at shifts [26,27] → values from those same historical price bars.
+    double chikouAtClosedBar[2];     // [0]=closed bar, [1]=prev (plotted 26/27 back in price time)
+    double kijunAtSameHistorical[2]; // [0]=Kijun@26 back, [1]=Kijun@27 back
 
-    if (CopyBuffer(ichimokuHandle, 4, 1, 2, chikouPlottedAtClosedBar) < 2)
+    if (CopyBuffer(g_ichimokuHandle, 4, 0, 2, chikouAtClosedBar) < 2)
     {
-        Print("CopyBuffer for Chikou failed: ", GetLastError());
+        if (DebugLog) Print("[Ichimoku EA] CopyBuffer Chikou failed: ", GetLastError());
+        return;
+    }
+    if (CopyBuffer(g_ichimokuHandle, 1, Kijun, 2, kijunAtSameHistorical) < 2)
+    {
+        if (DebugLog) Print("[Ichimoku EA] CopyBuffer Kijun failed: ", GetLastError());
         return;
     }
 
-    if (CopyBuffer(ichimokuHandle, 1, Kijun + 1, 2, kijunHistoricalAtClosedBar) < 2)
+    double chikou_closed   = chikouAtClosedBar[0];
+    double chikou_previous = chikouAtClosedBar[1];
+    double kijun_closed    = kijunAtSameHistorical[0];
+    double kijun_previous  = kijunAtSameHistorical[1];
+
+    // Ignore if indicator hasn't enough history at those points
+    if (chikou_closed == EMPTY_VALUE || chikou_previous == EMPTY_VALUE ||
+        kijun_closed == EMPTY_VALUE  || kijun_previous  == EMPTY_VALUE)
     {
-        Print("CopyBuffer for Kijun failed: ", GetLastError());
+        if (DebugLog) Print("[Ichimoku EA] EMPTY_VALUE encountered — waiting for more history");
         return;
     }
 
-    double chikouClosedBar   = chikouPlottedAtClosedBar[0];
-    double chikouPreviousBar = chikouPlottedAtClosedBar[1];
-    double kijunClosedBar    = kijunHistoricalAtClosedBar[0];
-    double kijunPreviousBar  = kijunHistoricalAtClosedBar[1];
+    // Cross detection on the historical timeline
+    bool crossed_bullish = (chikou_previous <= kijun_previous) && (chikou_closed > kijun_closed);
+    bool crossed_bearish = (chikou_previous >= kijun_previous) && (chikou_closed < kijun_closed);
 
-    bool bullish = (chikouPreviousBar <= kijunPreviousBar) && (chikouClosedBar > kijunClosedBar);
-    bool bearish = (chikouPreviousBar >= kijunPreviousBar) && (chikouClosedBar < kijunClosedBar);
+    if (DebugLog)
+    {
+        PrintFormat("[Ichimoku EA] ChikouPrev=%.5f ChikouNow=%.5f | KijunPrev=%.5f KijunNow=%.5f | Bull=%s Bear=%s",
+                    chikou_previous, chikou_closed, kijun_previous, kijun_closed,
+                    crossed_bullish?"T":"F", crossed_bearish?"T":"F");
+    }
 
+    // Use closed bar time to throttle once-per-bar
     datetime closedBarTime = iTime(_Symbol, Timeframe, 1);
-    if (closedBarTime == lastAlertBarTime)
+    if (closedBarTime == g_lastAlertBarTime)
         return;
 
-    if ((bullish || bearish) && EnableAlerts)
+    if ((crossed_bullish || crossed_bearish) && EnableAlerts)
     {
-        lastAlertBarTime = closedBarTime;
+        g_lastAlertBarTime = closedBarTime;
         double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
         string tf = TimeframeToString(Timeframe);
-        string dir = bullish ? "Bullish" : "Bearish";
-        Alert(_Symbol, " ", dir, " Chikou crossed historical Kijun (closed) on ", tf, " at ", DoubleToString(price, _Digits));
+        string dir = crossed_bullish ? "Bullish" : "Bearish";
+        Alert(_Symbol, " ", dir, " Chikou x historical Kijun (closed) on ", tf,
+              " at ", DoubleToString(price, _Digits));
     }
 }
 
