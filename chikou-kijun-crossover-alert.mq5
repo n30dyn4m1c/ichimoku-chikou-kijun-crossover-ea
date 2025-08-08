@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Neo Malesa"
 #property link      "https://www.x.com/n30dyn4m1c"
-#property version   "1.02"
+#property version   "1.03"
 #property strict
 
 input ENUM_TIMEFRAMES Timeframe = PERIOD_CURRENT;
@@ -80,14 +80,13 @@ bool IsNewBar()
 
 bool EnoughBars()
 {
-    // Need enough history to reference chikou[2] & kijun[28]
+    // Need enough history to reference Chikou and Kijun values from 26+ bars back
     int bars = Bars(_Symbol, Timeframe);
-    return (bars >= (Kijun + 3)); // why: closed-bar confirmation shifts everything by +1
+    return (bars >= (Kijun + 3));
 }
 
 void OnTick()
 {
-    // Only evaluate once a new bar appears => prior bar is closed
     if (!IsNewBar())
         return;
 
@@ -95,46 +94,43 @@ void OnTick()
         return;
 
     // CLOSED-BAR CONFIRMATION:
-    // Evaluate crossover on the last CLOSED bar.
-    //   - Chikou: take plotted values at shifts [1,2] (belong to bars 27 & 28 back)
-    //   - Kijun : take values at shifts [Kijun+1, Kijun+2] => [27,28]
-    double chikou[2];
-    double kijun_hist[2];
+    //   Bullish: Chikou crosses ABOVE historical Kijun (both values from same historical bar)
+    //   Bearish: Chikou crosses BELOW historical Kijun
+    double chikouPlottedAtClosedBar[2]; // Chikou plotted points for closed bar and its previous
+    double kijunHistoricalAtClosedBar[2]; // Kijun values from the same historical bars as Chikou
 
-    if (CopyBuffer(ichimokuHandle, 4, 1, 2, chikou) < 2) // chikou[0]=closed bar's plotted point
+    if (CopyBuffer(ichimokuHandle, 4, 1, 2, chikouPlottedAtClosedBar) < 2)
     {
         Print("CopyBuffer for Chikou failed: ", GetLastError());
         return;
     }
 
-    if (CopyBuffer(ichimokuHandle, 1, Kijun + 1, 2, kijun_hist) < 2)
+    if (CopyBuffer(ichimokuHandle, 1, Kijun + 1, 2, kijunHistoricalAtClosedBar) < 2)
     {
         Print("CopyBuffer for Kijun failed: ", GetLastError());
         return;
     }
 
-    double chikou_curr = chikou[0]; // closed bar
-    double chikou_prev = chikou[1]; // bar before closed
-    double kijun_curr  = kijun_hist[0];
-    double kijun_prev  = kijun_hist[1];
+    double chikouClosedBar   = chikouPlottedAtClosedBar[0];
+    double chikouPreviousBar = chikouPlottedAtClosedBar[1];
+    double kijunClosedBar    = kijunHistoricalAtClosedBar[0];
+    double kijunPreviousBar  = kijunHistoricalAtClosedBar[1];
 
-    bool bullish = (chikou_prev < kijun_prev) && (chikou_curr > kijun_curr);
-    bool bearish = (chikou_prev > kijun_prev) && (chikou_curr < kijun_curr);
+    bool bullish = (chikouPreviousBar <= kijunPreviousBar) && (chikouClosedBar > kijunClosedBar);
+    bool bearish = (chikouPreviousBar >= kijunPreviousBar) && (chikouClosedBar < kijunClosedBar);
 
-    // Avoid duplicate alerts in rare edge cases
-    datetime barTime = iTime(_Symbol, Timeframe, 1); // the closed bar's time
-    if (barTime == lastAlertBarTime)
+    datetime closedBarTime = iTime(_Symbol, Timeframe, 1);
+    if (closedBarTime == lastAlertBarTime)
         return;
 
     if ((bullish || bearish) && EnableAlerts)
     {
-        lastAlertBarTime = barTime;
+        lastAlertBarTime = closedBarTime;
         double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
         string tf = TimeframeToString(Timeframe);
         string dir = bullish ? "Bullish" : "Bearish";
-        Alert(_Symbol, " ", dir, " Chikou crossed Kijun (closed) on ", tf, " at ", DoubleToString(price, _Digits));
+        Alert(_Symbol, " ", dir, " Chikou crossed historical Kijun (closed) on ", tf, " at ", DoubleToString(price, _Digits));
     }
 }
 
 //+------------------------------------------------------------------+
-
