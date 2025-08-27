@@ -1,10 +1,12 @@
 //+------------------------------------------------------------------+
-//| Ichimoku EA + DI filter + DI-exit + Imminent-DI (MT5)            |
-//| On Chikou–Kijun cross: close any trade; open if DI validates     |
-//| or DI momentum implies imminent cross. Exit on opposite DI cross |
+//| Ichimoku EA + DI filter + DI-exit + Imminent-DI + P/L Alerts     |
+//| On Chikou–Kijun cross: close any trade; open if DI validates or  |
+//| DI momentum implies imminent cross. Exit on opposite DI cross.   |
+//| Alerts are deduped; close alerts show dollar P/L.                |
+//| v1.50 – DI exit uses +DI/-DI spread crossing (not ADX).          |
 //+------------------------------------------------------------------+
 #property copyright "Neo Malesa"
-#property version   "1.47"
+#property version   "1.50"
 #property strict
 #include <Trade/Trade.mqh>
 
@@ -17,13 +19,19 @@ input int Tenkan = 9, Kijun = 26, Senkou = 52;
 input bool AlertTenkanClose=true, AlertKijunClose=true, AlertPriceCloudCross=true, AlertChikouCloudCross=true;
 input bool  ShowCountdown=true; input color CountdownColor=clrLime; input int CountdownFontPx=20, CountdownPadY=10;
 input double Lots=0.10; input int DeviationPts=20;
-input double DIImminentThresh=4.0; // min |ΔDI| over 1 bar for early validation
+input double DIImminentThresh=4.0;     // 1-bar |ΔDI| threshold for early validation
+input double DIExitEps=0.5;            // min |DI spread| after cross to trigger exit
+input int    AlertCooldownSec=5;       // suppress duplicate alerts within N sec
 
 CTrade trade;
 
 //==================== Globals ===================//
 int g_ichimokuHandle=INVALID_HANDLE, g_adxHandle=INVALID_HANDLE;
 datetime g_lastCK=0, g_lastPX=0, g_lastCX=0, g_lastTK=0, g_lastKJ=0, g_lastTwoMinTarget=0;
+string g_lastMsg=""; datetime g_lastAlert=0;
+
+// ADX buffer indices
+const int BUF_ADX=0, BUF_PDI=1, BUF_MDI=2;
 
 //==================== Utils =====================//
 string TF(ENUM_TIMEFRAMES tf){ if(tf==PERIOD_CURRENT) tf=(ENUM_TIMEFRAMES)Period();
@@ -33,36 +41,49 @@ string TF(ENUM_TIMEFRAMES tf){ if(tf==PERIOD_CURRENT) tf=(ENUM_TIMEFRAMES)Period
 bool GetBuf(const int h,const int b,const int sh,double &v){ double t[1]; int c=CopyBuffer(h,b,sh,1,t); if(c!=1) return false; v=t[0]; return true; }
 bool NewBar(){ static datetime lt=0; datetime t=iTime(_Symbol,Timeframe,0); if(t!=lt){ lt=t; return true;} return false; }
 bool EnoughBars(){ return Bars(_Symbol,Timeframe) >= (Kijun+Senkou+10); }
-void Fire(const datetime barTime, datetime &gate, const string msg){ if(!EnableAlerts) return; if(barTime!=gate) gate=barTime; Alert(msg); }
+void AlertOnce(const string msg){ if(!EnableAlerts) return; datetime now=TimeCurrent(); if(msg!=g_lastMsg || (now-g_lastAlert)>AlertCooldownSec){ g_lastMsg=msg; g_lastAlert=now; Alert(msg);} }
+void Fire(const datetime bt, datetime &gate, const string msg){ if(!EnableAlerts) return; if(bt!=gate){ gate=bt; AlertOnce(msg);} }
 
 //==================== ADX / DI ==================//
 bool GetDI(const int sh,double &plusDI,double &minusDI){
   if(g_adxHandle==INVALID_HANDLE) return false;
   double p[1], m[1];
-  if(CopyBuffer(g_adxHandle,1,sh,1,p)!=1) return false;   // +DI
-  if(CopyBuffer(g_adxHandle,2,sh,1,m)!=1) return false;   // -DI
+  if(CopyBuffer(g_adxHandle,BUF_PDI,sh,1,p)!=1) return false;
+  if(CopyBuffer(g_adxHandle,BUF_MDI,sh,1,m)!=1) return false;
   plusDI=p[0]; minusDI=m[0];
   return (plusDI!=EMPTY_VALUE && minusDI!=EMPTY_VALUE);
 }
 bool DIFilter(const bool bull,double &p,double &m){ if(!GetDI(1,p,m)) return false; return bull ? (p>m) : (m>p); }
-bool DIXBull(){ double p1,m1,p2,m2; if(!GetDI(1,p1,m1)||!GetDI(2,p2,m2)) return false; return (p2<=m2 && p1>m1); }
-bool DIXBear(){ double p1,m1,p2,m2; if(!GetDI(1,p1,m1)||!GetDI(2,p2,m2)) return false; return (p2>=m2 && p1<m1); }
-// Imminent cross: strong 1-bar DI divergence toward desired side
 bool DIImminent(const bool bull){
   double p1,m1,p2,m2; if(!GetDI(1,p1,m1)||!GetDI(2,p2,m2)) return false;
-  double dP=p1-p2, dM=m1-m2; // recent momentum
+  double dP=p1-p2, dM=m1-m2;
   return bull ? (dP>=DIImminentThresh && dM<=-DIImminentThresh)
               : (dM>=DIImminentThresh && dP<=-DIImminentThresh);
+}
+// Exit on +DI/-DI spread crossing with threshold
+bool DIXBull(){ // -DI→+DI cross (bear->bull)
+  double p1,m1,p2,m2; if(!GetDI(1,p1,m1)||!GetDI(2,p2,m2)) return false;
+  double s2=p2-m2; // prev spread
+  double s1=p1-m1; // curr spread
+  return (s2<=0.0 && s1>0.0 && s1>=DIExitEps);
+}
+bool DIXBear(){ // +DI→-DI cross (bull->bear)
+  double p1,m1,p2,m2; if(!GetDI(1,p1,m1)||!GetDI(2,p2,m2)) return false;
+  double s2=p2-m2;
+  double s1=p1-m1;
+  return (s2>=0.0 && s1<0.0 && (-s1)>=DIExitEps);
 }
 
 //==================== Trade notes ===============//
 void NoteOpen(const string side){
-  Alert(_Symbol," [",TF(Timeframe),"] ",side," OPEN @ ",DoubleToString(trade.ResultPrice(),_Digits),
-        " | ",trade.ResultRetcodeDescription());
+  AlertOnce(StringFormat("%s [%s] %s OPEN @ %.*f | %s",
+    _Symbol,TF(Timeframe),side,_Digits,trade.ResultPrice(),trade.ResultRetcodeDescription()));
 }
 void NoteClose(const string side){
-  Alert(_Symbol," [",TF(Timeframe),"] ",side," CLOSE @ ",DoubleToString(trade.ResultPrice(),_Digits),
-        " | ",trade.ResultRetcodeDescription());
+  double pl=0; ulong d=trade.ResultDeal();
+  if(d>0 && HistoryDealSelect(d)) pl=HistoryDealGetDouble(d,DEAL_PROFIT);
+  AlertOnce(StringFormat("%s [%s] %s CLOSE @ %.*f | P/L = %.2f %s | %s",
+    _Symbol,TF(Timeframe),side,_Digits,trade.ResultPrice(),pl,AccountInfoString(ACCOUNT_CURRENCY),trade.ResultRetcodeDescription()));
 }
 
 //==================== Trading helpers (netting) ==//
@@ -71,14 +92,14 @@ int  OpenDir(){ if(!HasOurPosition()) return 0; return PositionGetInteger(POSITI
 bool CloseIfAny(){
   if(!HasOurPosition()) return true;
   string curSide = OpenDir()>0 ? "BUY" : "SELL";
-  if(!trade.PositionClose(_Symbol)){ Alert(_Symbol," [",TF(Timeframe),"] ",curSide," close FAILED (",trade.ResultRetcodeDescription(),")"); return false; }
+  if(!trade.PositionClose(_Symbol)){ AlertOnce(StringFormat("%s [%s] %s close FAILED (%s)",_Symbol,TF(Timeframe),curSide,trade.ResultRetcodeDescription())); return false; }
   NoteClose(curSide); return true;
 }
 bool OpenDirIfValid(const int dir){
   trade.SetExpertMagicNumber(MagicNumber); trade.SetDeviationInPoints(DeviationPts);
   bool ok=(dir>0)?trade.Buy(Lots,_Symbol):trade.Sell(Lots,_Symbol);
   string side=(dir>0)?"BUY":"SELL";
-  if(ok) NoteOpen(side); else Alert(_Symbol," [",TF(Timeframe),"] ",side," open FAILED (",trade.ResultRetcodeDescription(),")");
+  if(ok) NoteOpen(side); else AlertOnce(StringFormat("%s [%s] %s open FAILED (%s)",_Symbol,TF(Timeframe),side,trade.ResultRetcodeDescription()));
   return ok;
 }
 
@@ -104,13 +125,13 @@ void UpdateCountdown(){
   ObjectSetInteger(0,COUNT_NAME,OBJPROP_COLOR,rem<=10?clrRed:CountdownColor);
   long w=ChartGetInteger(0,CHART_WIDTH_IN_PIXELS);
   ObjectSetInteger(0,COUNT_NAME,OBJPROP_XDISTANCE,(int)(w/2)); ChartRedraw(0);
-  if(rem<=120 && g_lastTwoMinTarget!=next){ g_lastTwoMinTarget=next; if(EnableAlerts) Alert(_Symbol," 2 minutes to new hour (",TF(Timeframe),")"); }
+  if(rem<=120 && g_lastTwoMinTarget!=next){ g_lastTwoMinTarget=next; AlertOnce(StringFormat("%s 2 minutes to new hour (%s)",_Symbol,TF(Timeframe))); }
 }
 
 //==================== Lifecycle =================//
 int OnInit(){
-  g_ichimokuHandle=iIchimoku(_Symbol,Timeframe,Tenkan,Kijun,Senkou); if(g_ichimokuHandle==INVALID_HANDLE){ Alert("Ichimoku handle failed"); return INIT_FAILED; }
-  g_adxHandle=iADX(_Symbol,Timeframe,14);                              if(g_adxHandle==INVALID_HANDLE){ Alert("ADX handle failed"); return INIT_FAILED; }
+  g_ichimokuHandle=iIchimoku(_Symbol,Timeframe,Tenkan,Kijun,Senkou); if(g_ichimokuHandle==INVALID_HANDLE){ AlertOnce("Ichimoku handle failed"); return INIT_FAILED; }
+  g_adxHandle=iADX(_Symbol,Timeframe,14);                              if(g_adxHandle==INVALID_HANDLE){ AlertOnce("ADX handle failed"); return INIT_FAILED; }
   trade.SetExpertMagicNumber(MagicNumber); trade.SetDeviationInPoints(DeviationPts);
   if(ShowCountdown){ EventSetTimer(1); MakeCountdown(); UpdateCountdown(); }
   return INIT_SUCCEEDED;
@@ -147,20 +168,20 @@ void OnTick(){
         // 2) Validate with DI or Imminent DI momentum
         double pDI,mDI; bool pass=DIFilter(bull,pDI,mDI);
         if(!pass && DIImminent(bull)){
-          Alert(_Symbol," [",TF(Timeframe),"] ",cross," crossover EARLY VALID (DI momentum) ",
-                "| +DIΔ/-DIΔ >= ",DoubleToString(DIImminentThresh,1));
+          AlertOnce(StringFormat("%s [%s] %s crossover EARLY VALID (DI momentum) | |ΔDI| >= %.1f",
+                    _Symbol,TF(Timeframe),cross,DIImminentThresh));
           pass=true;
         }
 
         if(pass){
-          Alert(_Symbol," [",TF(Timeframe),"] ",cross," crossover VALID → ",bull?"BUY":"SELL",
-                " | +DI=",DoubleToString(pDI,1),"  -DI=",DoubleToString(mDI,1));
+          AlertOnce(StringFormat("%s [%s] %s crossover VALID → %s | +DI=%.1f  -DI=%.1f",
+                   _Symbol,TF(Timeframe),cross,(bull?"BUY":"SELL"),pDI,mDI));
           OpenDirIfValid(bull?+1:-1);
         }else{
-          Alert(_Symbol," [",TF(Timeframe),"] ",cross," crossover NO-TRADE (DI filter) ",
-                "| +DI=",DoubleToString(pDI,1),"  -DI=",DoubleToString(mDI,1));
+          AlertOnce(StringFormat("%s [%s] %s crossover NO-TRADE (DI filter) | +DI=%.1f  -DI=%.1f",
+                   _Symbol,TF(Timeframe),cross,pDI,mDI));
         }
-        Fire(barTime,g_lastCK,_Symbol+" "+cross+" Chikou-Kijun Crossover on "+TF(Timeframe));
+        Fire(barTime,g_lastCK,StringFormat("%s %s Chikou-Kijun Crossover on %s",_Symbol,cross,TF(Timeframe)));
       }
     }
   }
@@ -170,14 +191,14 @@ void OnTick(){
     double tk_p,tk_n; if(GetBuf(g_ichimokuHandle,0,2,tk_p)&&GetBuf(g_ichimokuHandle,0,1,tk_n)){
       double c_p=iClose(_Symbol,Timeframe,2), c_n=iClose(_Symbol,Timeframe,1);
       bool up=(c_p<=tk_p+eps)&&(c_n>tk_n+eps), dn=(c_p>=tk_p-eps)&&(c_n<tk_n-eps);
-      if(up||dn) Fire(barTime,g_lastTK,_Symbol+(up?" Price closed ABOVE Tenkan":" Price closed BELOW Tenkan")+" on "+TF(Timeframe));
+      if(up||dn) Fire(barTime,g_lastTK,StringFormat("%s %s on %s",_Symbol,(up?" Price closed ABOVE Tenkan":" Price closed BELOW Tenkan"),TF(Timeframe)));
     }
   }
   if(AlertKijunClose){
     double kjp,kjn; if(GetBuf(g_ichimokuHandle,1,2,kjp)&&GetBuf(g_ichimokuHandle,1,1,kjn)){
       double c_p=iClose(_Symbol,Timeframe,2), c_n=iClose(_Symbol,Timeframe,1);
       bool up=(c_p<=kjp+eps)&&(c_n>kjn+eps), dn=(c_p>=kjp-eps)&&(c_n<kjn-eps);
-      if(up||dn) Fire(barTime,g_lastKJ,_Symbol+(up?" Price closed ABOVE Kijun":" Price closed BELOW Kijun")+" on "+TF(Timeframe));
+      if(up||dn) Fire(barTime,g_lastKJ,StringFormat("%s %s on %s",_Symbol,(up?" Price closed ABOVE Kijun":" Price closed BELOW Kijun"),TF(Timeframe)));
     }
   }
 
@@ -195,11 +216,12 @@ void OnTick(){
       bool is_above=c_n>top_n+eps,  is_below=c_n<bot_n-eps,  is_in=!(is_above||is_below);
       bool px_in=(was_above||was_below)&&is_in, px_above=was_in&&is_above, px_below=was_in&&is_below;
       bool px_jump_up=was_below&&is_above, px_jump_dn=was_above&&is_below;
-      if(px_in) Fire(barTime,g_lastPX,_Symbol+" Price closed INSIDE Kumo on "+TF(Timeframe));
-      if(px_above) Fire(barTime,g_lastPX,_Symbol+" Price closed ABOVE Kumo on "+TF(Timeframe));
-      if(px_below) Fire(barTime,g_lastPX,_Symbol+" Price closed BELOW Kumo on "+TF(Timeframe));
-      if(px_jump_up) Fire(barTime,g_lastPX,_Symbol+" Price jumped ABOVE Kumo on "+TF(Timeframe));
-      if(px_jump_dn) Fire(barTime,g_lastPX,_Symbol+" Price dropped BELOW Kumo on "+TF(Timeframe));
+ if(px_in)      Fire(barTime,g_lastPX,StringFormat("%s Price closed INSIDE Kumo on %s",_Symbol,TF(Timeframe)));
+if(px_above)   Fire(barTime,g_lastPX,StringFormat("%s Price closed ABOVE Kumo on %s",_Symbol,TF(Timeframe)));
+if(px_below)   Fire(barTime,g_lastPX,StringFormat("%s Price closed BELOW Kumo on %s",_Symbol,TF(Timeframe))); // FIXED
+if(px_jump_up) Fire(barTime,g_lastPX,StringFormat("%s Price jumped ABOVE Kumo on %s",_Symbol,TF(Timeframe)));
+if(px_jump_dn) Fire(barTime,g_lastPX,StringFormat("%s Price dropped BELOW Kumo on %s",_Symbol,TF(Timeframe)));
+
     }
   }
 
@@ -216,14 +238,14 @@ void OnTick(){
       bool was_above=chi_p>top_p+eps, was_below=chi_p<bot_p-eps, was_in=!(was_above||was_below);
       bool is_above =chi_n>top_n+eps,  is_below =chi_n<bot_n-eps;
       bool is_in=!(is_above||is_below);
-      if(is_in && (was_above||was_below)) Fire(barTime,g_lastCX,_Symbol+" Chikou closed INSIDE Kumo on "+TF(Timeframe));
-      if(was_in && is_above) Fire(barTime,g_lastCX,_Symbol+" Chikou closed ABOVE Kumo on "+TF(Timeframe));
-      if(was_in && is_below) Fire(barTime,g_lastCX,_Symbol+" Chikou closed BELOW Kumo on "+TF(Timeframe));
+      if(is_in && (was_above||was_below)) Fire(barTime,g_lastCX,StringFormat("%s Chikou closed INSIDE Kumo on %s",_Symbol,TF(Timeframe)));
+      if(was_in && is_above)              Fire(barTime,g_lastCX,StringFormat("%s Chikou closed ABOVE Kumo on %s",_Symbol,TF(Timeframe)));
+      if(was_in && is_below)              Fire(barTime,g_lastCX,StringFormat("%s Chikou closed BELOW Kumo on %s",_Symbol,TF(Timeframe)));
     }
   }
 
   // --- DI crossover exits (manage open trade) ---
   int dir=OpenDir();
-  if(dir>0 && DIXBear()){ if(CloseIfAny()) Alert(_Symbol," [",TF(Timeframe),"] BUY exited on -DI crossing above +DI"); }
-  if(dir<0 && DIXBull()){ if(CloseIfAny()) Alert(_Symbol," [",TF(Timeframe),"] SELL exited on +DI crossing above -DI"); }
+  if(dir>0 && DIXBear()){ if(CloseIfAny()) AlertOnce(StringFormat("%s [%s] BUY exited on +DI→-DI cross",_Symbol,TF(Timeframe))); }
+  if(dir<0 && DIXBull()){ if(CloseIfAny()) AlertOnce(StringFormat("%s [%s] SELL exited on -DI→+DI cross",_Symbol,TF(Timeframe))); }
 }
